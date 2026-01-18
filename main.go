@@ -310,30 +310,36 @@ func main() {
 	if v == "0.0.0" || v == "" {
 		v = os.Getenv("DEX_VERSION")
 	}
-    // (Other env vars would be set here same as TTS)
+	// (Other env vars would be set here same as TTS)
 
-    // LD_LIBRARY_PATH Injection for CTranslate2/cuDNN
-    // This logic mimics dex-cli/utils/whisper.go logic but simplified for the venv
-    // Actually, simply installing nvidia-* packages in venv usually handles it if the python script imports them.
-    // The main.py should handle importing nvidia.cudnn/cublas to set LD_LIBRARY_PATH if needed.
-    // But faster-whisper sometimes needs it in env before import.
-    // Let's rely on the python script setting os.environ["LD_LIBRARY_PATH"] internally before importing faster_whisper
-    // (I added that logic to mainPy above).
+	// LD_LIBRARY_PATH Injection for CTranslate2/cuDNN
+	// This logic mimics dex-cli/utils/whisper.go logic but simplified for the venv
+	// Actually, simply installing nvidia-* packages in venv usually handles it if the python script imports them.
+	// The main.py should handle importing nvidia.cudnn/cublas to set LD_LIBRARY_PATH if needed.
+	// But faster-whisper sometimes needs it in env before import.
+	// Let's rely on the python script setting os.environ["LD_LIBRARY_PATH"] internally before importing faster_whisper
+	// (I added that logic to mainPy above).
 
 	pythonCmd.Env = append(os.Environ(),
 		fmt.Sprintf("DEX_VERSION=%s", v),
+		fmt.Sprintf("DEX_BRANCH=%s", branch),
+		fmt.Sprintf("DEX_COMMIT=%s", commit),
+		fmt.Sprintf("DEX_BUILD_DATE=%s", buildDate),
+		fmt.Sprintf("DEX_BUILD_YEAR=%s", buildYear),
+		fmt.Sprintf("DEX_ARCH=%s", arch),
+		fmt.Sprintf("DEX_BUILD_HASH=%s", buildHash),
 	)
-	
+
 	pythonCmd.Stdout = os.Stdout
 	pythonCmd.Stderr = os.Stderr
-	
+
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
 		_ = pythonCmd.Process.Signal(os.Interrupt)
 	}()
-	
+
 	if err := pythonCmd.Run(); err != nil {
 		log.Printf("Service exited with error: %v", err)
 		os.Exit(1)
