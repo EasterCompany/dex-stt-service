@@ -30,6 +30,7 @@ import time
 import psutil
 import json
 import shutil
+import contextlib
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 import redis
@@ -64,8 +65,6 @@ MODEL_DIR = os.path.expanduser("~/Dexter/models/whisper/large-v3-turbo")
 DEVICE = os.getenv("DEX_STT_DEVICE", "cpu")
 logger.info(f"STT Service configured to use device: {DEVICE}")
 
-app = FastAPI(title="Dexter STT Service", version="1.0.0")
-
 def load_model():
     global model
     logger.info(f"Loading Whisper model ({MODEL_SIZE}) from {MODEL_DIR}...")
@@ -99,8 +98,8 @@ def load_model():
         # We don't exit here to allow the service to start and report health error
         model = None
 
-@app.on_event("startup")
-async def startup_event():
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
     global redis_client
     try:
         redis_client = redis.Redis(host='127.0.0.1', port=6379, db=0)
@@ -111,6 +110,12 @@ async def startup_event():
         redis_client = None
         
     load_model()
+    yield
+    if redis_client:
+        redis_client.close()
+    logger.info("STT Service shutdown complete.")
+
+app = FastAPI(title="Dexter STT Service", version="1.0.0", lifespan=lifespan)
 
 @app.get("/health")
 async def health_check():
@@ -156,8 +161,6 @@ class TranscribeRequest(BaseModel):
 async def transcribe(
     file: UploadFile = File(None),
     redis_key: str = None # Accept as query param or form data?
-    # Pydantic model for JSON body is cleaner but UploadFile conflicts with it in same request usually.
-    # We'll support either File upload OR Redis key via form/query.
 ):
     global model
     if model is None:
@@ -308,20 +311,22 @@ func main() {
 	pythonBin := filepath.Join(pythonEnvDir, "bin", "python")
 	pipBin := filepath.Join(pythonEnvDir, "bin", "pip")
 
-	// Ensure the shared environment exists (dex-cli should have created it, but just in case)
+	// Ensure the shared environment exists
 	if _, err := os.Stat(pythonBin); os.IsNotExist(err) {
 		log.Fatalf("Shared Python 3.10 environment not found at %s. Run 'dex verify' or 'dex build' to fix.", pythonBin)
 	}
 
+	log.Println("Ensuring pip is up-to-date...")
+	pipUpdateCmd := exec.Command(pipBin, "install", "--upgrade", "pip")
+	_ = pipUpdateCmd.Run()
+
 	log.Println("Installing dependencies into shared environment...")
-	// Always install/update dependencies to ensure they are present in the shared env
 	pipCmd := exec.Command(pipBin, "install", "-r", "requirements.txt")
 	pipCmd.Dir = serviceDir
 	pipCmd.Stdout = os.Stdout
 	pipCmd.Stderr = os.Stderr
 	if err := pipCmd.Run(); err != nil {
 		log.Printf("Warning: Failed to install dependencies: %v", err)
-		// We warn instead of fatal because sometimes pip fails on trivial things but the env is fine
 	}
 
 	log.Println("Starting Dexter STT Service...")
@@ -329,20 +334,10 @@ func main() {
 	pythonCmd := exec.Command(pythonBin, "main.py")
 	pythonCmd.Dir = serviceDir
 
-	// Inherit and extend environment
 	v := version
 	if v == "0.0.0" || v == "" {
 		v = os.Getenv("DEX_VERSION")
 	}
-	// (Other env vars would be set here same as TTS)
-
-	// LD_LIBRARY_PATH Injection for CTranslate2/cuDNN
-	// This logic mimics dex-cli/utils/whisper.go logic but simplified for the venv
-	// Actually, simply installing nvidia-* packages in venv usually handles it if the python script imports them.
-	// The main.py should handle importing nvidia.cudnn/cublas to set LD_LIBRARY_PATH if needed.
-	// But faster-whisper sometimes needs it in env before import.
-	// Let's rely on the python script setting os.environ["LD_LIBRARY_PATH"] internally before importing faster_whisper
-	// (I added that logic to mainPy above).
 
 	pythonCmd.Env = append(os.Environ(),
 		fmt.Sprintf("DEX_VERSION=%s", v),
