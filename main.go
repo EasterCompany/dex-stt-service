@@ -117,7 +117,7 @@ async def service_status():
     uptime_seconds = time.time() - START_TIME
     
     m, s = divmod(uptime_seconds, 60)
-    h, m = divmod(h, 60)
+    h, m = divmod(m, 60)
     d, h = divmod(h, 24)
     
     parts = []
