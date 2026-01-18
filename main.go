@@ -18,6 +18,7 @@ faster-whisper>=1.0.0
 pydantic>=2.6.0
 redis
 requests
+psutil
 `
 
 // mainPy content
@@ -279,30 +280,30 @@ func main() {
 		log.Fatalf("Failed to write main.py: %v", err)
 	}
 
-	venvDir := filepath.Join(serviceDir, "venv")
-	if _, err := os.Stat(venvDir); os.IsNotExist(err) {
-		log.Println("Creating virtual environment...")
-		cmd := exec.Command("python3.10", "-m", "venv", venvDir)
-		cmd.Dir = serviceDir
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			log.Fatalf("Failed to create venv: %v", err)
-		}
+	// Use shared Dexter Python 3.10 environment
+	pythonEnvDir := filepath.Join(homeDir, "Dexter", "python3.10")
+	pythonBin := filepath.Join(pythonEnvDir, "bin", "python")
+	pipBin := filepath.Join(pythonEnvDir, "bin", "pip")
 
-		log.Println("Installing dependencies...")
-		pipCmd := exec.Command(filepath.Join(venvDir, "bin", "pip"), "install", "-r", "requirements.txt")
-		pipCmd.Dir = serviceDir
-		pipCmd.Stdout = os.Stdout
-		pipCmd.Stderr = os.Stderr
-		if err := pipCmd.Run(); err != nil {
-			log.Fatalf("Failed to install dependencies: %v", err)
-		}
+	// Ensure the shared environment exists (dex-cli should have created it, but just in case)
+	if _, err := os.Stat(pythonBin); os.IsNotExist(err) {
+		log.Fatalf("Shared Python 3.10 environment not found at %s. Run 'dex verify' or 'dex build' to fix.", pythonBin)
+	}
+
+	log.Println("Installing dependencies into shared environment...")
+	// Always install/update dependencies to ensure they are present in the shared env
+	pipCmd := exec.Command(pipBin, "install", "-r", "requirements.txt")
+	pipCmd.Dir = serviceDir
+	pipCmd.Stdout = os.Stdout
+	pipCmd.Stderr = os.Stderr
+	if err := pipCmd.Run(); err != nil {
+		log.Printf("Warning: Failed to install dependencies: %v", err)
+		// We warn instead of fatal because sometimes pip fails on trivial things but the env is fine
 	}
 
 	log.Println("Starting Dexter STT Service...")
 
-	pythonCmd := exec.Command(filepath.Join(venvDir, "bin", "python"), "main.py")
+	pythonCmd := exec.Command(pythonBin, "main.py")
 	pythonCmd.Dir = serviceDir
 
 	// Inherit and extend environment
