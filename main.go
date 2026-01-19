@@ -159,8 +159,8 @@ class TranscribeRequest(BaseModel):
 
 @app.post("/transcribe")
 async def transcribe(
-    file: UploadFile = File(None),
-    redis_key: str = None # Accept as query param or form data?
+    request: TranscribeRequest = None,
+    file: UploadFile = File(None)
 ):
     global model
     if model is None:
@@ -171,6 +171,7 @@ async def transcribe(
 
     audio_source = None
     cleanup_path = None
+    redis_key = request.redis_key if request else None
 
     try:
         # 1. Determine Source
