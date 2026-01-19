@@ -32,7 +32,7 @@ import json
 import shutil
 import contextlib
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Form, Request
 from pydantic import BaseModel
 import redis
 from faster_whisper import WhisperModel
@@ -160,8 +160,7 @@ class TranscribeRequest(BaseModel):
 
 @app.post("/transcribe")
 async def transcribe(
-    request: Optional[TranscribeRequest] = None,
-    redis_key: Optional[str] = Body(None),
+    request: Request,
     file: Optional[UploadFile] = File(None)
 ):
     global model
@@ -173,16 +172,27 @@ async def transcribe(
 
     audio_source = None
     cleanup_path = None
-    
-    # Resolve redis_key from multiple possible sources
     r_key = None
-    if request and request.redis_key:
-        r_key = request.redis_key
-    elif redis_key:
-        r_key = redis_key
+
+    # 1. Try to extract redis_key from various sources
+    # Check JSON body first
+    if request.headers.get("content-type") == "application/json":
+        try:
+            body = await request.json()
+            r_key = body.get("redis_key")
+        except:
+            pass
+    
+    # Check Form data if not in JSON
+    if not r_key:
+        try:
+            form = await request.form()
+            r_key = form.get("redis_key")
+        except:
+            pass
 
     try:
-        # 1. Determine Source
+        # 2. Determine Source
         if file:
             # Save to temp file
             temp_filename = f"upload_{int(time.time())}_{file.filename}"
@@ -199,8 +209,9 @@ async def transcribe(
             if not audio_data:
                 raise HTTPException(status_code=404, detail=f"Redis key not found: {r_key}")
             
-            temp_filename = f"redis_{r_key}.wav".replace(":", "_")
-            temp_path = os.path.join("/tmp", temp_filename)
+            # Sanitize key for filename (Redis keys contain colons which are bad for filenames)
+            safe_key = "".join([c if c.isalnum() or c in "._-" else "_" for c in r_key])
+            temp_path = os.path.join("/tmp", f"stt_{safe_key}.wav")
             with open(temp_path, "wb") as f:
                 f.write(audio_data)
             audio_source = temp_path
@@ -208,7 +219,7 @@ async def transcribe(
         else:
             raise HTTPException(status_code=400, detail="No audio file or redis_key provided")
 
-        # 2. Transcribe
+        # 3. Transcribe
         logger.info(f"Transcribing {audio_source}...")
         segments, info = model.transcribe(
             audio_source,
