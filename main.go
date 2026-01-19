@@ -31,7 +31,8 @@ import psutil
 import json
 import shutil
 import contextlib
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from typing import Optional
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from pydantic import BaseModel
 import redis
 from faster_whisper import WhisperModel
@@ -155,12 +156,13 @@ async def service_status():
     }
 
 class TranscribeRequest(BaseModel):
-    redis_key: str = None
+    redis_key: Optional[str] = None
 
 @app.post("/transcribe")
 async def transcribe(
-    request: TranscribeRequest = None,
-    file: UploadFile = File(None)
+    request: Optional[TranscribeRequest] = None,
+    redis_key: Optional[str] = Body(None),
+    file: Optional[UploadFile] = File(None)
 ):
     global model
     if model is None:
@@ -171,7 +173,13 @@ async def transcribe(
 
     audio_source = None
     cleanup_path = None
-    redis_key = request.redis_key if request else None
+    
+    # Resolve redis_key from multiple possible sources
+    r_key = None
+    if request and request.redis_key:
+        r_key = request.redis_key
+    elif redis_key:
+        r_key = redis_key
 
     try:
         # 1. Determine Source
@@ -183,15 +191,15 @@ async def transcribe(
                 shutil.copyfileobj(file.file, buffer)
             audio_source = temp_path
             cleanup_path = temp_path
-        elif redis_key:
+        elif r_key:
             if not redis_client:
                 raise HTTPException(status_code=500, detail="Redis unavailable")
             
-            audio_data = redis_client.get(redis_key)
+            audio_data = redis_client.get(r_key)
             if not audio_data:
-                raise HTTPException(status_code=404, detail="Redis key not found")
+                raise HTTPException(status_code=404, detail=f"Redis key not found: {r_key}")
             
-            temp_filename = f"redis_{redis_key}.wav"
+            temp_filename = f"redis_{r_key}.wav".replace(":", "_")
             temp_path = os.path.join("/tmp", temp_filename)
             with open(temp_path, "wb") as f:
                 f.write(audio_data)
@@ -233,6 +241,9 @@ async def transcribe(
 
         return {"text": full_text, "language": info.language, "probability": info.language_probability}
 
+    except HTTPException:
+        # Re-raise HTTP exceptions to maintain status codes
+        raise
     except Exception as e:
         logger.error(f"Transcription error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
