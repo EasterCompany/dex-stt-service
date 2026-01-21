@@ -149,10 +149,34 @@ async def service_status():
     parts.append(f"{float(s):.3f}s")
     uptime_str = "".join(parts)
 
+    # Try Environment Variables (Injected by Go Wrapper)
+    branch = os.getenv("DEX_BRANCH", "unknown")
+    commit = os.getenv("DEX_COMMIT", "unknown")
+    version_str = os.getenv("DEX_VERSION", "0.0.0")
+    build_date = os.getenv("DEX_BUILD_DATE", "unknown")
+    arch = os.getenv("DEX_ARCH", "unknown")
+    build_hash = os.getenv("DEX_BUILD_HASH", "unknown")
+
+    version_parts = version_str.split('.')
+    major = version_parts[0] if len(version_parts) > 0 else "0"
+    minor = version_parts[1] if len(version_parts) > 1 else "0"
+    patch = version_parts[2] if len(version_parts) > 2 else "0"
+
+    full_version_str = f"{version_str}.{branch}.{commit}.{build_date}.{arch}"
+
     return {
         "version": {
-            "str": os.getenv("DEX_VERSION", "0.0.0"),
-            # Simplified for now
+            "str": full_version_str,
+            "obj": {
+                "major": major,
+                "minor": minor,
+                "patch": patch,
+                "branch": branch,
+                "commit": commit,
+                "build_date": build_date,
+                "arch": arch,
+                "build_hash": build_hash
+            }
         },
         "health": {
             "status": "ok" if model is not None else "error",
@@ -320,7 +344,15 @@ func main() {
 		if v == "" {
 			v = "0.0.0"
 		}
-		fmt.Println(v)
+		b := branch
+		if b == "unknown" || b == "" {
+			b = os.Getenv("DEX_BRANCH")
+		}
+		c := commit
+		if c == "unknown" || c == "" {
+			c = os.Getenv("DEX_COMMIT")
+		}
+		fmt.Printf("%s.%s.%s.%s.%s.%s.%s\n", v, b, c, buildDate, buildYear, buildHash, arch)
 		return
 	}
 
@@ -390,10 +422,20 @@ func main() {
 		v = os.Getenv("DEX_VERSION")
 	}
 
+	b := branch
+	if b == "unknown" || b == "" {
+		b = os.Getenv("DEX_BRANCH")
+	}
+
+	c := commit
+	if c == "unknown" || c == "" {
+		c = os.Getenv("DEX_COMMIT")
+	}
+
 	pythonCmd.Env = append(os.Environ(),
 		fmt.Sprintf("DEX_VERSION=%s", v),
-		fmt.Sprintf("DEX_BRANCH=%s", branch),
-		fmt.Sprintf("DEX_COMMIT=%s", commit),
+		fmt.Sprintf("DEX_BRANCH=%s", b),
+		fmt.Sprintf("DEX_COMMIT=%s", c),
 		fmt.Sprintf("DEX_BUILD_DATE=%s", buildDate),
 		fmt.Sprintf("DEX_BUILD_YEAR=%s", buildYear),
 		fmt.Sprintf("DEX_ARCH=%s", arch),
