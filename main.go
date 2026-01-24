@@ -119,7 +119,7 @@ func buildWhisper(binDir, destBin string) error {
 
 	log.Println("Compiling whisper-cli (CUDA enabled if detected)...")
 	// Try building with CUDA support if nvcc is present
-	makeArgs := []string{" -C", tmpDir, "-j", fmt.Sprintf("%d", runtime.NumCPU()), "whisper-cli"}
+	makeArgs := []string{"-C", tmpDir, "-j", fmt.Sprintf("%d", runtime.NumCPU()), "whisper-cli"}
 	if _, err := exec.LookPath("nvcc"); err == nil {
 		log.Println("NVCC found, enabling CUDA support.")
 		_ = os.Setenv("GGML_CUDA", "1")
