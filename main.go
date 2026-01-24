@@ -120,8 +120,8 @@ func buildWhisper(binDir, destBin string) error {
 	buildDir := filepath.Join(tmpDir, "build")
 	_ = os.MkdirAll(buildDir, 0755)
 
-	log.Println("Configuring whisper-cli with CMake (Static Strategy)...")
-	// Aggressively disable shared libs to ensure a standalone binary
+	log.Println("Configuring whisper-cli with CMake (Standalone Strategy)...")
+	// Attempt to force static build while ensuring examples are built
 	cmakeArgs := []string{
 		"..",
 		"-DWHISPER_BUILD_EXAMPLES=ON",
@@ -129,6 +129,7 @@ func buildWhisper(binDir, destBin string) error {
 		"-DGGML_STATIC=ON",
 		"-DGGML_SHARED=OFF",
 		"-DWHISPER_ALL_EXTERNAL=OFF",
+		"-DCMAKE_BUILD_TYPE=Release",
 	}
 
 	if _, err := exec.LookPath("nvcc"); err == nil {
@@ -138,43 +139,44 @@ func buildWhisper(binDir, destBin string) error {
 
 	configCmd := exec.Command("cmake", cmakeArgs...)
 	configCmd.Dir = buildDir
-	configCmd.Stdout = os.Stdout
-	configCmd.Stderr = os.Stderr
-	if err := configCmd.Run(); err != nil {
-		return fmt.Errorf("cmake config failed: %w", err)
-	}
+	configOutput, _ := configCmd.CombinedOutput()
+	log.Printf("CMake Config Output:\n%s", string(configOutput))
 
 	log.Println("Building whisper-cli...")
 	buildCmd := exec.Command("cmake", "--build", ".", "--config", "Release", "--target", "whisper-cli", "-j", fmt.Sprintf("%d", runtime.NumCPU()))
 	buildCmd.Dir = buildDir
-	buildCmd.Stdout = os.Stdout
-	buildCmd.Stderr = os.Stderr
-	if err := buildCmd.Run(); err != nil {
+	buildOutput, err := buildCmd.CombinedOutput()
+	if err != nil {
+		log.Printf("Build failed:\n%s", string(buildOutput))
 		return fmt.Errorf("cmake build failed: %w", err)
 	}
 
 	// Move binary (use 'mv' to handle cross-device links)
 	_ = os.MkdirAll(binDir, 0755)
-	sourceBin := filepath.Join(buildDir, "bin", "whisper-cli")
 
-	// Fallback check: if bin/whisper-cli doesn't exist, search for it
-	if _, err := os.Stat(sourceBin); os.IsNotExist(err) {
-		findBin := exec.Command("find", buildDir, "-name", "whisper-cli", "-type", "f")
-		out, _ := findBin.Output()
-		if len(out) > 0 {
-			sourceBin = strings.TrimSpace(string(out))
-		}
+	// Search for the binary in the build directory
+	findBin := exec.Command("find", buildDir, "-name", "whisper-cli", "-type", "f")
+	binPathBytes, _ := findBin.Output()
+	sourceBin := strings.TrimSpace(string(binPathBytes))
+
+	if sourceBin == "" {
+		return fmt.Errorf("could not find whisper-cli binary in build directory")
 	}
 
+	log.Printf("Found whisper-cli at: %s", sourceBin)
 	mvCmd := exec.Command("mv", sourceBin, destBin)
 	if err := mvCmd.Run(); err != nil {
 		return fmt.Errorf("failed to move binary to destination: %w", err)
 	}
 
 	// Robustly find and copy all shared libraries (just in case something was linked dynamically)
-	log.Println("Capturing any built shared libraries...")
-	findLibsCmd := fmt.Sprintf(`find %s -name '*.so*' -exec cp -Pd {} %s \;`, tmpDir, binDir)
-	_ = exec.Command("bash", "-c", findLibsCmd).Run()
+	// Even if we requested static, dependencies might have built as shared
+	log.Println("Capturing any built shared libraries from the entire build tree...")
+	findLibsCmd := fmt.Sprintf(`find %s -name "*.so*" -exec cp -Pd {} %s \;`, tmpDir, binDir)
+	err = exec.Command("bash", "-c", findLibsCmd).Run()
+	if err != nil {
+		log.Printf("Warning: capture libs command reported error (may be fine if none exist): %v", err)
+	}
 
 	return nil
 }
@@ -236,7 +238,7 @@ func handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	// whisper-cli -m <model> -f <file> -nt (no timestamps)
 	cmd := exec.Command(whisperBin, "-m", modelPath, "-f", audioPath, "-nt")
 
-	// Ensure we check local bin for shared libraries too
+	// CRITICAL: Ensure we check local bin for shared libraries
 	cmd.Env = append(os.Environ(), fmt.Sprintf("LD_LIBRARY_PATH=%s:%s", binDir, os.Getenv("LD_LIBRARY_PATH")))
 
 	var out bytes.Buffer
