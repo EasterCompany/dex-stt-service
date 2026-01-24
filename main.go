@@ -57,13 +57,14 @@ model = None
 redis_client = None
 
 # Constants
-MODEL_SIZE = "large-v3-turbo"
-# Dexter standard model path
-MODEL_DIR = os.path.expanduser("~/Dexter/models/whisper/large-v3-turbo")
+# Switched to Distil-Whisper for VRAM efficiency and Latency
+MODEL_SIZE = "distil-medium.en"
+MODEL_ID = "Systran/faster-distil-whisper-medium.en"
+MODEL_DIR = os.path.expanduser("~/Dexter/models/whisper/distil-medium.en")
 
 # Device Configuration
-# Default to "cpu" to save VRAM, but allow override via env var
-DEVICE = os.getenv("DEX_STT_DEVICE", "cpu")
+# Default to "cuda" for latency, assuming VRAM is available (it uses very little ~600MB)
+DEVICE = os.getenv("DEX_STT_DEVICE", "cuda")
 logger.info(f"STT Service configured to use device: {DEVICE}")
 
 def load_model():
@@ -74,22 +75,20 @@ def load_model():
     if DEVICE == "cuda":
         compute_type = "float16"
     else:
-        compute_type = "int8" # Best for CPU
+        compute_type = "int8"
     
     try:
         # Check if model exists locally
         if not os.path.exists(MODEL_DIR) or not os.listdir(MODEL_DIR):
             logger.info("Model not found locally. Downloading...")
-            # Use specific high-quality conversion
-            model_id = "deepdml/faster-whisper-large-v3-turbo-ct2"
             try:
-                download_model(model_id, output_dir=MODEL_DIR)
+                download_model(MODEL_ID, output_dir=MODEL_DIR)
                 logger.info("Model download complete.")
             except Exception as e:
                 logger.error(f"Failed to download model: {e}")
-                # Try falling back to default large-v3 if custom fails
-                logger.info("Attempting fallback to default large-v3...")
-                download_model("large-v3", output_dir=MODEL_DIR)
+                # Fallback to standard tiny if distil fails
+                logger.info("Attempting fallback to tiny.en...")
+                download_model("tiny.en", output_dir=MODEL_DIR)
 
         try:
             model = WhisperModel(MODEL_DIR, device=DEVICE, compute_type=compute_type)
@@ -105,7 +104,6 @@ def load_model():
         logger.info("Whisper model loaded successfully.")
     except Exception as e:
         logger.error(f"FATAL: Failed to load Whisper model: {e}")
-        # We don't exit here to allow the service to start and report health error
         model = None
 
 @contextlib.asynccontextmanager
@@ -199,7 +197,6 @@ async def transcribe(
 ):
     global model
     if model is None:
-        # Try reloading
         load_model()
         if model is None:
             raise HTTPException(status_code=503, detail="STT model not loaded")
@@ -209,8 +206,6 @@ async def transcribe(
     r_key = None
     f_path = None
 
-    # 1. Try to extract params from various sources
-    # Check JSON body first
     if request.headers.get("content-type") == "application/json":
         try:
             body = await request.json()
@@ -219,7 +214,6 @@ async def transcribe(
         except:
             pass
     
-    # Check Form data if not in JSON
     if not r_key and not f_path:
         try:
             form = await request.form()
@@ -229,22 +223,11 @@ async def transcribe(
             pass
 
     try:
-        # 2. Determine Source (Priority: Local Path > Upload > Redis)
-        if f_path:
-            # Validate path exists and is safe (basic check)
-            if os.path.exists(f_path):
-                audio_source = f_path
-                # We do NOT cleanup external paths by default, assumes caller handles it or it's a temp file we own?
-                # Actually, for this optimization, the producer creates it in tmp, consumer reads it.
-                # Who deletes it? Usually the consumer if it's a hand-off.
-                # Let's assume we clean it up to prevent disk fill-up since it's a temp hand-off.
-                cleanup_path = f_path
-            else:
-                logger.warning(f"Provided file_path not found: {f_path}")
-                # Fallthrough to other methods if valid
+        if f_path and os.path.exists(f_path):
+            audio_source = f_path
+            # For local files provided by path, we don't delete them
         
         if not audio_source and file:
-            # Save to temp file
             temp_filename = f"upload_{int(time.time())}_{file.filename}"
             temp_path = os.path.join("/tmp", temp_filename)
             with open(temp_path, "wb") as buffer:
@@ -260,7 +243,6 @@ async def transcribe(
             if not audio_data:
                 raise HTTPException(status_code=404, detail=f"Redis key not found: {r_key}")
             
-            # Sanitize key for filename
             safe_key = "".join([c if c.isalnum() or c in "._-" else "_" for c in r_key])
             temp_path = os.path.join("/tmp", f"stt_{safe_key}.wav")
             with open(temp_path, "wb") as f:
@@ -269,14 +251,13 @@ async def transcribe(
             cleanup_path = temp_path
             
         if not audio_source:
-            raise HTTPException(status_code=400, detail="No audio source provided (file_path, file, or redis_key)")
+            raise HTTPException(status_code=400, detail="No audio source provided")
 
-        # 3. Transcribe
         logger.info(f"Transcribing {audio_source}...")
         segments, info = model.transcribe(
             audio_source,
             beam_size=5,
-            language="en", # Force English for now
+            language="en",
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500)
         )
@@ -286,15 +267,9 @@ async def transcribe(
 
         for segment in segments:
             text_clean = segment.text.strip().lower()
-            
-            # Anti-Hallucination Logic
-            is_hallucination = False
             if text_clean in hallucinations:
-                is_hallucination = True
+                continue
             if "thank you" in text_clean and len(text_clean) < 25:
-                is_hallucination = True
-            
-            if is_hallucination and segment.avg_logprob < -0.25:
                 continue
                 
             text_parts.append(segment.text)
@@ -305,7 +280,6 @@ async def transcribe(
         return {"text": full_text, "language": info.language, "probability": info.language_probability}
 
     except HTTPException:
-        # Re-raise HTTP exceptions to maintain status codes
         raise
     except Exception as e:
         logger.error(f"Transcription error: {e}")
@@ -317,7 +291,7 @@ async def transcribe(
 if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", "8202")) # STT on 8202
+    port = int(os.getenv("PORT", "8202"))
     
     log_config = uvicorn.config.LOGGING_CONFIG
     log_config["loggers"]["uvicorn.access"]["level"] = "WARNING"
@@ -373,8 +347,7 @@ func main() {
 		log.Fatalf("Failed to write main.py: %v", err)
 	}
 
-	// Load options.json to get configuration
-	device := "cpu" // Default
+	device := "cuda" // Default to CUDA
 	optionsPath := filepath.Join(homeDir, "Dexter", "config", "options.json")
 	if data, err := os.ReadFile(optionsPath); err == nil {
 		var opts struct {
@@ -389,12 +362,10 @@ func main() {
 		}
 	}
 
-	// Use shared Dexter Python 3.10 environment
 	pythonEnvDir := filepath.Join(homeDir, "Dexter", "python3.10")
 	pythonBin := filepath.Join(pythonEnvDir, "bin", "python")
 	pipBin := filepath.Join(pythonEnvDir, "bin", "pip")
 
-	// Ensure the shared environment exists
 	if _, err := os.Stat(pythonBin); os.IsNotExist(err) {
 		log.Fatalf("Shared Python 3.10 environment not found at %s. Run 'dex verify' or 'dex build' to fix.", pythonBin)
 	}
