@@ -120,8 +120,9 @@ func buildWhisper(binDir, destBin string) error {
 	buildDir := filepath.Join(tmpDir, "build")
 	_ = os.MkdirAll(buildDir, 0755)
 
-	log.Println("Configuring whisper-cli with CMake...")
-	cmakeArgs := []string{"..", "-DWHISPER_BUILD_EXAMPLES=ON"}
+	log.Println("Configuring whisper-cli with CMake (Static Build)...")
+	// -DBUILD_SHARED_LIBS=OFF to ensure libwhisper is baked into the binary
+	cmakeArgs := []string{"..", "-DWHISPER_BUILD_EXAMPLES=ON", "-DBUILD_SHARED_LIBS=OFF"}
 	if _, err := exec.LookPath("nvcc"); err == nil {
 		log.Println("NVCC found, enabling CUDA support.")
 		cmakeArgs = append(cmakeArgs, "-DWHISPER_CUDA=ON")
@@ -144,13 +145,21 @@ func buildWhisper(binDir, destBin string) error {
 		return fmt.Errorf("cmake build failed: %w", err)
 	}
 
-	// Move binary (use 'mv' to handle cross-device links between /tmp and /home)
+	// Move binary (use 'mv' to handle cross-device links)
 	_ = os.MkdirAll(binDir, 0755)
 	sourceBin := filepath.Join(buildDir, "bin", "whisper-cli")
 	mvCmd := exec.Command("mv", sourceBin, destBin)
 	if err := mvCmd.Run(); err != nil {
 		return fmt.Errorf("failed to move binary to destination: %w", err)
 	}
+
+	// Also move any .so files just in case static build didn't catch everything (like ggml backend)
+	files, _ := filepath.Glob(filepath.Join(buildDir, "**", "*.so*"))
+	for _, f := range files {
+		dest := filepath.Join(binDir, filepath.Base(f))
+		_ = exec.Command("cp", "-d", f, dest).Run()
+	}
+
 	return nil
 }
 
@@ -204,11 +213,16 @@ func handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	home, _ := os.UserHomeDir()
-	whisperBin := filepath.Join(home, "Dexter", "bin", "whisper-cli")
+	binDir := filepath.Join(home, "Dexter", "bin")
+	whisperBin := filepath.Join(binDir, "whisper-cli")
 	modelPath := filepath.Join(home, "Dexter", "models", "whisper", "ggml-medium-distil.bin")
 
 	// whisper-cli -m <model> -f <file> -nt (no timestamps)
 	cmd := exec.Command(whisperBin, "-m", modelPath, "-f", audioPath, "-nt")
+
+	// Ensure we check local bin for shared libraries too
+	cmd.Env = append(os.Environ(), fmt.Sprintf("LD_LIBRARY_PATH=%s:%s", binDir, os.Getenv("LD_LIBRARY_PATH")))
+
 	var out bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &out
