@@ -1,473 +1,259 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
-	"syscall"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
 )
 
-// requirementsTxt content
-const requirementsTxt = `fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-python-multipart
-faster-whisper>=1.0.0
-pydantic>=2.6.0
-redis
-requests
-psutil
-`
-
-// mainPy content
-const mainPy = `import os
-import sys
-import logging
-import time
-import psutil
-import json
-import shutil
-import contextlib
-import gc
-from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Form, Request
-from pydantic import BaseModel
-import redis
-from faster_whisper import WhisperModel, download_model
-
-# Force standard streams to be unbuffered
-sys.stdout.reconfigure(line_buffering=True)
-sys.stderr.reconfigure(line_buffering=True)
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+const (
+	ServiceName = "dex-stt-service"
+	ModelUrl    = "https://huggingface.co/distil-whisper/distil-medium.en/resolve/main/ggml-medium-32-2.en.bin"
+	RepoUrl     = "https://github.com/ggml-org/whisper.cpp.git"
 )
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-logger = logging.getLogger("dex-stt-service")
-
-START_TIME = time.time()
-
-# Global variables
-model = None
-redis_client = None
-
-# Constants
-# Switched to Distil-Whisper for VRAM efficiency and Latency
-MODEL_SIZE = "distil-medium.en"
-MODEL_ID = "Systran/faster-distil-whisper-medium.en"
-MODEL_DIR = os.path.expanduser("~/Dexter/models/whisper/distil-medium.en")
-
-# Device Configuration
-# Default to "cuda" for latency, assuming VRAM is available (it uses very little ~600MB)
-DEVICE = os.getenv("DEX_STT_DEVICE", "cuda")
-logger.info(f"STT Service configured to use device: {DEVICE}")
-
-def load_model():
-    global model
-    if model is not None:
-        return
-
-    logger.info(f"Loading Whisper model ({MODEL_SIZE}) from {MODEL_DIR}...")
-    
-    # Configure compute type based on device
-    if DEVICE == "cuda":
-        compute_type = "float16"
-    else:
-        compute_type = "int8"
-    
-    try:
-        # Check if model exists locally
-        if not os.path.exists(MODEL_DIR) or not os.listdir(MODEL_DIR):
-            logger.info("Model not found locally. Downloading...")
-            try:
-                download_model(MODEL_ID, output_dir=MODEL_DIR)
-                logger.info("Model download complete.")
-            except Exception as e:
-                logger.error(f"Failed to download model: {e}")
-                # Fallback to standard tiny if distil fails
-                logger.info("Attempting fallback to tiny.en...")
-                download_model("tiny.en", output_dir=MODEL_DIR)
-
-        try:
-            model = WhisperModel(MODEL_DIR, device=DEVICE, compute_type=compute_type)
-            logger.info(f"Initialized Whisper on {DEVICE.upper()} with {compute_type} precision")
-        except Exception as e:
-            if DEVICE == "cuda":
-                logger.warning(f"CUDA initialization failed ({e}), falling back to CPU...")
-                model = WhisperModel(MODEL_DIR, device="cpu", compute_type="int8")
-                logger.info("Initialized Whisper on CPU (Fallback)")
-            else:
-                raise e
-            
-        logger.info("Whisper model loaded successfully.")
-    except Exception as e:
-        logger.error(f"FATAL: Failed to load Whisper model: {e}")
-        model = None
-
-def unload_model():
-    global model
-    if model is not None:
-        logger.info("Unloading STT model...")
-        del model
-        model = None
-        gc.collect()
-        if DEVICE == "cuda":
-            try:
-                import torch
-                torch.cuda.empty_cache()
-            except:
-                pass
-        logger.info("STT model unloaded.")
-
-@contextlib.asynccontextmanager
-async def lifespan(app: FastAPI):
-    global redis_client
-    try:
-        redis_client = redis.Redis(host='127.0.0.1', port=6379, db=0)
-        redis_client.ping()
-        logger.info("Connected to Redis.")
-    except Exception as e:
-        logger.warning(f"Failed to connect to Redis: {e}")
-        redis_client = None
-        
-    # Start unloaded to save VRAM until needed?
-    # Or load on startup? 
-    # User requested: "when not in voice mode ... unloaded".
-    # Default state is likely not in voice mode.
-    # So we should NOT load_model() here by default, or unload immediately?
-    # Or rely on Orchestrator to hibernate.
-    # Let's load it to ensure it works, then Orchestrator can hibernate.
-    # Or better: Lazy loading.
-    # But lazy loading adds latency to first request.
-    # User said "latency is top priority" IN VOICE MODE.
-    # So Voice Mode activation should trigger wakeup (pre-load).
-    # I'll stick to lazy loading logic in transcribe, but allow explicit wakeup.
-    
-    # load_model() # Disabled for lazy load / orchestration control
-    yield
-    if redis_client:
-        redis_client.close()
-    logger.info("STT Service shutdown complete.")
-
-app = FastAPI(title="Dexter STT Service", version="1.0.0", lifespan=lifespan)
-
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "model": MODEL_SIZE, "loaded": model is not None}
-
-@app.get("/service")
-async def service_status():
-    process = psutil.Process(os.getpid())
-    uptime_seconds = time.time() - START_TIME
-    
-    m, s = divmod(uptime_seconds, 60)
-    h, m = divmod(m, 60)
-    d, h = divmod(h, 24)
-    
-    parts = []
-    if d > 0: parts.append(f"{int(d)}d")
-    if h > 0: parts.append(f"{int(h)}h")
-    if m > 0: parts.append(f"{int(m)}m")
-    parts.append(f"{float(s):.3f}s")
-    uptime_str = "".join(parts)
-
-    # Try Environment Variables (Injected by Go Wrapper)
-    branch = os.getenv("DEX_BRANCH", "unknown")
-    commit = os.getenv("DEX_COMMIT", "unknown")
-    version_str = os.getenv("DEX_VERSION", "0.0.0")
-    build_date = os.getenv("DEX_BUILD_DATE", "unknown")
-    arch = os.getenv("DEX_ARCH", "unknown")
-    build_hash = os.getenv("DEX_BUILD_HASH", "unknown")
-
-    version_parts = version_str.split('.')
-    major = version_parts[0] if len(version_parts) > 0 else "0"
-    minor = version_parts[1] if len(version_parts) > 1 else "0"
-    patch = version_parts[2] if len(version_parts) > 2 else "0"
-
-    full_version_str = f"{version_str}.{branch}.{commit}.{build_date}.{arch}"
-
-    return {
-        "version": {
-            "str": full_version_str,
-            "obj": {
-                "major": major,
-                "minor": minor,
-                "patch": patch,
-                "branch": branch,
-                "commit": commit,
-                "build_date": build_date,
-                "arch": arch,
-                "build_hash": build_hash
-            }
-        },
-        "health": {
-            "status": "ok",
-            "uptime": uptime_str,
-            "loaded": model is not None
-        },
-        "metrics": {
-            "cpu": { "avg": process.cpu_percent(interval=None) },
-            "memory": { "avg": process.memory_info().rss / 1024 / 1024 }
-        }
-    }
-
-class TranscribeRequest(BaseModel):
-    redis_key: Optional[str] = None
-    file_path: Optional[str] = None
-
-@app.post("/hibernate")
-async def hibernate():
-    unload_model()
-    return {"status": "ok", "message": "Hibernated"}
-
-@app.post("/wakeup")
-async def wakeup():
-    if model is None:
-        load_model()
-    return {"status": "ok", "message": "Ready"}
-
-@app.post("/transcribe")
-async def transcribe(
-    request: Request,
-    file: Optional[UploadFile] = File(None)
-):
-    global model
-    if model is None:
-        load_model()
-        if model is None:
-            raise HTTPException(status_code=503, detail="STT model not loaded")
-
-    audio_source = None
-    cleanup_path = None
-    r_key = None
-    f_path = None
-
-    if request.headers.get("content-type") == "application/json":
-        try:
-            body = await request.json()
-            r_key = body.get("redis_key")
-            f_path = body.get("file_path")
-        except:
-            pass
-    
-    if not r_key and not f_path:
-        try:
-            form = await request.form()
-            r_key = form.get("redis_key")
-            f_path = form.get("file_path")
-        except:
-            pass
-
-    try:
-        if f_path and os.path.exists(f_path):
-            audio_source = f_path
-            # For local files provided by path, we don't delete them
-        
-        if not audio_source and file:
-            temp_filename = f"upload_{int(time.time())}_{file.filename}"
-            temp_path = os.path.join("/tmp", temp_filename)
-            with open(temp_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            audio_source = temp_path
-            cleanup_path = temp_path
-            
-        if not audio_source and r_key:
-            if not redis_client:
-                raise HTTPException(status_code=500, detail="Redis unavailable")
-            
-            audio_data = redis_client.get(r_key)
-            if not audio_data:
-                raise HTTPException(status_code=404, detail=f"Redis key not found: {r_key}")
-            
-            safe_key = "".join([c if c.isalnum() or c in "._-" else "_" for c in r_key])
-            temp_path = os.path.join("/tmp", f"stt_{safe_key}.wav")
-            with open(temp_path, "wb") as f:
-                f.write(audio_data)
-            audio_source = temp_path
-            cleanup_path = temp_path
-            
-        if not audio_source:
-            raise HTTPException(status_code=400, detail="No audio source provided")
-
-        logger.info(f"Transcribing {audio_source}...")
-        segments, info = model.transcribe(
-            audio_source,
-            beam_size=5,
-            language="en",
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500)
-        )
-
-        text_parts = []
-        hallucinations = ["thank you", "thanks", "you", "bye", "thank you.", "thanks.", "you.", "bye."]
-
-        for segment in segments:
-            text_clean = segment.text.strip().lower()
-            if text_clean in hallucinations:
-                continue
-            if "thank you" in text_clean and len(text_clean) < 25:
-                continue
-                
-            text_parts.append(segment.text)
-
-        full_text = "".join(text_parts).strip()
-        logger.info(f"Transcription: {full_text}")
-
-        return {"text": full_text, "language": info.language, "probability": info.language_probability}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Transcription error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if cleanup_path and os.path.exists(cleanup_path):
-            os.remove(cleanup_path)
-
-if __name__ == "__main__":
-    import uvicorn
-    host = os.getenv("HOST", "127.0.0.1")
-    port = int(os.getenv("PORT", "8202"))
-    
-    log_config = uvicorn.config.LOGGING_CONFIG
-    log_config["loggers"]["uvicorn.access"]["level"] = "WARNING"
-    
-    uvicorn.run(app, host=host, port=port, log_config=log_config)
-`
 
 var (
 	version   = "0.0.0"
 	branch    = "unknown"
 	commit    = "unknown"
 	buildDate = "unknown"
-	buildYear = "unknown"
-	buildHash = "unknown"
-	arch      = "unknown"
+	arch      = runtime.GOARCH
+	startTime = time.Now()
+
+	mu      sync.Mutex
+	isReady = false
 )
+
+type TranscribeResponse struct {
+	Text        string  `json:"text"`
+	Language    string  `json:"language"`
+	Probability float64 `json:"probability"`
+}
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "version" {
-		v := version
-		if v == "0.0.0" || v == "" {
-			v = os.Getenv("DEX_VERSION")
+		fmt.Printf("%s.%s.%s.%s.%s\n", version, branch, commit, buildDate, arch)
+		os.Exit(0)
+	}
+
+	flag.Parse()
+
+	// Async setup
+	go func() {
+		if err := ensureAssets(); err != nil {
+			log.Printf("Asset setup failed: %v", err)
+		} else {
+			mu.Lock()
+			isReady = true
+			mu.Unlock()
+			log.Println("STT Assets ready.")
 		}
-		if v == "" {
-			v = "0.0.0"
+	}()
+
+	http.HandleFunc("/transcribe", handleTranscribe)
+	http.HandleFunc("/hibernate", handleHibernate)
+	http.HandleFunc("/wakeup", handleWakeup)
+	http.HandleFunc("/health", handleHealth)
+	http.HandleFunc("/service", handleService)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8202"
+	}
+
+	log.Printf("Starting Dexter STT Service (Whisper-Go) on port %s", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
+}
+
+func ensureAssets() error {
+	home, _ := os.UserHomeDir()
+	binDir := filepath.Join(home, "Dexter", "bin")
+	whisperBin := filepath.Join(binDir, "whisper-cli")
+	modelsDir := filepath.Join(home, "Dexter", "models", "whisper")
+	modelPath := filepath.Join(modelsDir, "ggml-medium-distil.bin")
+
+	// 1. whisper-cli binary
+	if _, err := os.Stat(whisperBin); os.IsNotExist(err) {
+		log.Println("Whisper binary missing. Building from source...")
+		if err := buildWhisper(binDir, whisperBin); err != nil {
+			return fmt.Errorf("failed to build whisper: %w", err)
 		}
-		b := branch
-		if b == "unknown" || b == "" {
-			b = os.Getenv("DEX_BRANCH")
+	}
+
+	// 2. Model
+	_ = os.MkdirAll(modelsDir, 0755)
+	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
+		log.Println("Downloading Distil-Whisper GGML model...")
+		if err := downloadFile(ModelUrl, modelPath); err != nil {
+			return fmt.Errorf("failed to download model: %w", err)
 		}
-		c := commit
-		if c == "unknown" || c == "" {
-			c = os.Getenv("DEX_COMMIT")
-		}
-		fmt.Printf("%s.%s.%s.%s.%s\n", v, b, c, buildDate, arch)
+	}
+
+	return nil
+}
+
+func buildWhisper(binDir, destBin string) error {
+	tmpDir := "/tmp/whisper-build"
+	_ = os.RemoveAll(tmpDir)
+	_ = os.MkdirAll(tmpDir, 0755)
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	log.Println("Cloning whisper.cpp...")
+	cloneCmd := exec.Command("git", "clone", "--depth", "1", RepoUrl, tmpDir)
+	if err := cloneCmd.Run(); err != nil {
+		return err
+	}
+
+	log.Println("Compiling whisper-cli (CUDA enabled if detected)...")
+	// Try building with CUDA support if nvcc is present
+	makeArgs := []string{" -C", tmpDir, "-j", fmt.Sprintf("%d", runtime.NumCPU()), "whisper-cli"}
+	if _, err := exec.LookPath("nvcc"); err == nil {
+		log.Println("NVCC found, enabling CUDA support.")
+		_ = os.Setenv("GGML_CUDA", "1")
+	}
+
+	makeCmd := exec.Command("make", makeArgs...)
+	makeCmd.Stdout = os.Stdout
+	makeCmd.Stderr = os.Stderr
+	if err := makeCmd.Run(); err != nil {
+		return err
+	}
+
+	// Move binary
+	_ = os.MkdirAll(binDir, 0755)
+	return os.Rename(filepath.Join(tmpDir, "whisper-cli"), destBin)
+}
+
+func downloadFile(url, dest string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = out.Close() }()
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
+
+func handleTranscribe(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	ready := isReady
+	mu.Unlock()
+
+	if !ready {
+		http.Error(w, "STT engine initializing", http.StatusServiceUnavailable)
 		return
 	}
 
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		log.Fatalf("Failed to get user home directory: %v", err)
-	}
+	// Support both multipart and JSON (for redis_key/file_path)
+	var audioPath string
 
-	serviceDir := filepath.Join(homeDir, "Dexter", "services", "dex-stt-service")
-	if err := os.MkdirAll(serviceDir, 0755); err != nil {
-		log.Fatalf("Failed to create service directory: %v", err)
-	}
-
-	if err := os.WriteFile(filepath.Join(serviceDir, "requirements.txt"), []byte(requirementsTxt), 0644); err != nil {
-		log.Fatalf("Failed to write requirements.txt: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(serviceDir, "main.py"), []byte(mainPy), 0644); err != nil {
-		log.Fatalf("Failed to write main.py: %v", err)
-	}
-
-	device := "cuda" // Default to CUDA
-	optionsPath := filepath.Join(homeDir, "Dexter", "config", "options.json")
-	if data, err := os.ReadFile(optionsPath); err == nil {
-		var opts struct {
-			Services map[string]map[string]interface{} `json:"services"`
+	if strings.Contains(r.Header.Get("Content-Type"), "multipart/form-data") {
+		err := r.ParseMultipartForm(10 << 20)
+		if err != nil {
+			http.Error(w, "Parse error", http.StatusBadRequest)
+			return
 		}
-		if err := json.Unmarshal(data, &opts); err == nil {
-			if svc, ok := opts.Services["stt"]; ok {
-				if val, ok := svc["device"].(string); ok {
-					device = val
-				}
-			}
+
+		filePath := r.FormValue("file_path")
+		if filePath != "" {
+			audioPath = filePath
+		} else {
+			http.Error(w, "file_path required", http.StatusBadRequest)
+			return
 		}
 	}
 
-	pythonEnvDir := filepath.Join(homeDir, "Dexter", "python3.10")
-	pythonBin := filepath.Join(pythonEnvDir, "bin", "python")
-	pipBin := filepath.Join(pythonEnvDir, "bin", "pip")
-
-	if _, err := os.Stat(pythonBin); os.IsNotExist(err) {
-		log.Fatalf("Shared Python 3.10 environment not found at %s. Run 'dex verify' or 'dex build' to fix.", pythonBin)
+	if audioPath == "" {
+		http.Error(w, "No audio source", http.StatusBadRequest)
+		return
 	}
 
-	log.Println("Ensuring pip is up-to-date...")
-	pipUpdateCmd := exec.Command(pipBin, "install", "--upgrade", "pip")
-	_ = pipUpdateCmd.Run()
+	home, _ := os.UserHomeDir()
+	whisperBin := filepath.Join(home, "Dexter", "bin", "whisper-cli")
+	modelPath := filepath.Join(home, "Dexter", "models", "whisper", "ggml-medium-distil.bin")
 
-	log.Println("Installing dependencies into shared environment...")
-	pipCmd := exec.Command(pipBin, "install", "-r", "requirements.txt")
-	pipCmd.Dir = serviceDir
-	pipCmd.Stdout = os.Stdout
-	pipCmd.Stderr = os.Stderr
-	if err := pipCmd.Run(); err != nil {
-		log.Printf("Warning: Failed to install dependencies: %v", err)
+	// whisper-cli -m <model> -f <file> -nt (no timestamps)
+	cmd := exec.Command(whisperBin, "-m", modelPath, "-f", audioPath, "-nt")
+	var out bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		log.Printf("Whisper failed: %v, Stderr: %s", err, stderr.String())
+		http.Error(w, "Transcription failed", http.StatusInternalServerError)
+		return
 	}
 
-	log.Println("Starting Dexter STT Service...")
+	text := strings.TrimSpace(out.String())
 
-	pythonCmd := exec.Command(pythonBin, "main.py")
-	pythonCmd.Dir = serviceDir
-
-	v := version
-	if v == "0.0.0" || v == "" {
-		v = os.Getenv("DEX_VERSION")
+	resp := TranscribeResponse{
+		Text:        text,
+		Language:    "en",
+		Probability: 1.0,
 	}
 
-	b := branch
-	if b == "unknown" || b == "" {
-		b = os.Getenv("DEX_BRANCH")
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func handleHibernate(w http.ResponseWriter, r *http.Request) {
+	_, _ = w.Write([]byte(`{"status":"ok","message":"process-idle"}`))
+}
+
+func handleWakeup(w http.ResponseWriter, r *http.Request) {
+	_, _ = w.Write([]byte(`{"status":"ok","message":"ready"}`))
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	ready := isReady
+	mu.Unlock()
+	if !ready {
+		http.Error(w, "initializing", http.StatusServiceUnavailable)
+		return
+	}
+	_, _ = w.Write([]byte("OK"))
+}
+
+func handleService(w http.ResponseWriter, r *http.Request) {
+	vParts := strings.Split(version, ".")
+	major, minor, patch := "0", "0", "0"
+	if len(vParts) >= 3 {
+		major, minor, patch = vParts[0], vParts[1], vParts[2]
 	}
 
-	c := commit
-	if c == "unknown" || c == "" {
-		c = os.Getenv("DEX_COMMIT")
+	report := map[string]interface{}{
+		"version": map[string]interface{}{
+			"str": fmt.Sprintf("%s.%s.%s.%s.%s", version, branch, commit, buildDate, arch),
+			"obj": map[string]interface{}{
+				"major": major, "minor": minor, "patch": patch,
+				"branch": branch, "commit": commit, "build_date": buildDate, "arch": arch,
+			},
+		},
+		"health": map[string]interface{}{
+			"status": "OK",
+			"uptime": time.Since(startTime).String(),
+		},
 	}
-
-	pythonCmd.Env = append(os.Environ(),
-		fmt.Sprintf("DEX_VERSION=%s", v),
-		fmt.Sprintf("DEX_BRANCH=%s", b),
-		fmt.Sprintf("DEX_COMMIT=%s", c),
-		fmt.Sprintf("DEX_BUILD_DATE=%s", buildDate),
-		fmt.Sprintf("DEX_BUILD_YEAR=%s", buildYear),
-		fmt.Sprintf("DEX_ARCH=%s", arch),
-		fmt.Sprintf("DEX_BUILD_HASH=%s", buildHash),
-		fmt.Sprintf("DEX_STT_DEVICE=%s", device),
-	)
-
-	pythonCmd.Stdout = os.Stdout
-	pythonCmd.Stderr = os.Stderr
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		_ = pythonCmd.Process.Signal(os.Interrupt)
-	}()
-
-	if err := pythonCmd.Run(); err != nil {
-		log.Printf("Service exited with error: %v", err)
-		os.Exit(1)
-	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(report)
 }
