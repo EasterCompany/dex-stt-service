@@ -126,6 +126,7 @@ func buildWhisper(binDir, destBin string) error {
 		"..",
 		"-DWHISPER_BUILD_EXAMPLES=ON",
 		"-DBUILD_SHARED_LIBS=OFF",
+		"-DGGML_STATIC=ON",
 		"-DGGML_SHARED=OFF",
 		"-DWHISPER_ALL_EXTERNAL=OFF",
 	}
