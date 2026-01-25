@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -19,8 +18,6 @@ import (
 
 const (
 	ServiceName = "dex-stt-service"
-	ModelUrl    = "https://huggingface.co/distil-whisper/distil-medium.en/resolve/main/ggml-medium-32-2.en.bin"
-	RepoUrl     = "https://github.com/ggml-org/whisper.cpp.git"
 )
 
 var (
@@ -49,16 +46,26 @@ func main() {
 
 	flag.Parse()
 
-	// Async setup
+	// Async verification of assets (provisioned by dex-cli during build)
 	go func() {
-		if err := ensureAssets(); err != nil {
-			log.Printf("Asset setup failed: %v", err)
-		} else {
-			mu.Lock()
-			isReady = true
-			mu.Unlock()
-			log.Println("STT Assets ready.")
+		home, _ := os.UserHomeDir()
+		binDir := filepath.Join(home, "Dexter", "bin", "stt")
+		sttBin := filepath.Join(binDir, "dex-net-stt")
+		modelPath := filepath.Join(home, "Dexter", "models", "dex-net-stt.bin")
+
+		for i := 0; i < 60; i++ {
+			if _, err := os.Stat(sttBin); err == nil {
+				if _, err := os.Stat(modelPath); err == nil {
+					mu.Lock()
+					isReady = true
+					mu.Unlock()
+					log.Println("STT Assets verified and ready.")
+					return
+				}
+			}
+			time.Sleep(2 * time.Second)
 		}
+		log.Println("Warning: STT Assets not found after 2 minutes. Service will remain in initializing state.")
 	}()
 
 	http.HandleFunc("/transcribe", handleTranscribe)
@@ -72,136 +79,10 @@ func main() {
 		port = "8202"
 	}
 
-	log.Printf("Starting Dexter STT Service (Whisper-Go) on port %s", port)
+	log.Printf("Starting Dexter STT Service (Neural STT Kernel) on port %s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
-}
-
-func ensureAssets() error {
-	home, _ := os.UserHomeDir()
-	binDir := filepath.Join(home, "Dexter", "bin")
-	whisperBin := filepath.Join(binDir, "whisper-cli")
-	modelsDir := filepath.Join(home, "Dexter", "models", "whisper")
-	modelPath := filepath.Join(modelsDir, "ggml-medium-distil.bin")
-
-	// Check if binary and essential shared libs exist
-	libsExist := true
-	if _, err := os.Stat(filepath.Join(binDir, "libwhisper.so.1")); os.IsNotExist(err) {
-		libsExist = false
-	}
-
-	// 1. whisper-cli binary and libs
-	if _, err := os.Stat(whisperBin); os.IsNotExist(err) || !libsExist {
-		log.Println("Whisper assets missing or incomplete. Building from source...")
-		if err := buildWhisper(binDir, whisperBin); err != nil {
-			return fmt.Errorf("failed to build whisper: %w", err)
-		}
-	}
-
-	// 2. Model
-	_ = os.MkdirAll(modelsDir, 0755)
-	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
-		log.Println("Downloading Distil-Whisper GGML model...")
-		if err := downloadFile(ModelUrl, modelPath); err != nil {
-			return fmt.Errorf("failed to download model: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func buildWhisper(binDir, destBin string) error {
-	tmpDir := "/tmp/whisper-build"
-	_ = os.RemoveAll(tmpDir)
-	_ = os.MkdirAll(tmpDir, 0755)
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	log.Println("Cloning whisper.cpp...")
-	cloneCmd := exec.Command("git", "clone", "--depth", "1", RepoUrl, tmpDir)
-	if err := cloneCmd.Run(); err != nil {
-		return err
-	}
-
-	buildDir := filepath.Join(tmpDir, "build")
-	_ = os.MkdirAll(buildDir, 0755)
-
-	log.Println("Configuring whisper-cli with CMake...")
-	cmakeArgs := []string{
-		"..",
-		"-DWHISPER_BUILD_EXAMPLES=ON",
-		"-DCMAKE_BUILD_TYPE=Release",
-	}
-
-	if _, err := exec.LookPath("nvcc"); err == nil {
-		log.Println("NVCC found, enabling CUDA support.")
-		cmakeArgs = append(cmakeArgs, "-DWHISPER_CUDA=ON")
-	}
-
-	configCmd := exec.Command("cmake", cmakeArgs...)
-	configCmd.Dir = buildDir
-	if out, err := configCmd.CombinedOutput(); err != nil {
-		log.Printf("CMake Config failed: %v\n%s", err, string(out))
-		return err
-	}
-
-	log.Println("Building whisper-cli...")
-	buildCmd := exec.Command("cmake", "--build", ".", "--config", "Release", "--target", "whisper-cli", "-j", fmt.Sprintf("%d", runtime.NumCPU()))
-	buildCmd.Dir = buildDir
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		log.Printf("Build failed: %v\n%s", err, string(out))
-		return err
-	}
-
-	// Move binary
-	_ = os.MkdirAll(binDir, 0755)
-	findBin := exec.Command("find", buildDir, "-name", "whisper-cli", "-type", "f")
-	binPathBytes, _ := findBin.Output()
-	sourceBin := strings.TrimSpace(string(binPathBytes))
-
-	if sourceBin == "" {
-		return fmt.Errorf("could not find whisper-cli binary")
-	}
-
-	log.Printf("Installing binary: %s", destBin)
-	_ = os.Remove(destBin) // Remove old if exists
-	mvCmd := exec.Command("mv", sourceBin, destBin)
-	if err := mvCmd.Run(); err != nil {
-		return err
-	}
-
-	// Capture all shared libraries from the build tree
-	log.Println("Capturing built shared libraries...")
-	findLibs := exec.Command("find", tmpDir, "-name", "*.so*")
-	libsBytes, _ := findLibs.Output()
-	libs := strings.Split(string(libsBytes), "\n")
-
-	for _, lib := range libs {
-		lib = strings.TrimSpace(lib)
-		if lib == "" {
-			continue
-		}
-		dest := filepath.Join(binDir, filepath.Base(lib))
-		// Use cp -Pd to preserve symlinks
-		_ = exec.Command("cp", "-Pd", lib, dest).Run()
-	}
-
-	return nil
-}
-
-func downloadFile(url, dest string) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	out, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = out.Close() }()
-	_, err = io.Copy(out, resp.Body)
-	return err
 }
 
 func handleTranscribe(w http.ResponseWriter, r *http.Request) {
@@ -210,7 +91,7 @@ func handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	if !ready {
-		http.Error(w, "STT engine initializing", http.StatusServiceUnavailable)
+		http.Error(w, "STT engine initializing (waiting for assets)", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -236,11 +117,13 @@ func handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	home, _ := os.UserHomeDir()
-	binDir := filepath.Join(home, "Dexter", "bin")
-	whisperBin := filepath.Join(binDir, "whisper-cli")
-	modelPath := filepath.Join(home, "Dexter", "models", "whisper", "ggml-medium-distil.bin")
+	binDir := filepath.Join(home, "Dexter", "bin", "stt")
+	sttBin := filepath.Join(binDir, "dex-net-stt")
+	modelPath := filepath.Join(home, "Dexter", "models", "dex-net-stt.bin")
 
-	cmd := exec.Command(whisperBin, "-m", modelPath, "-f", audioPath, "-nt")
+	cmd := exec.Command(sttBin, "-m", modelPath, "-f", audioPath, "-nt")
+
+	// CRITICAL: Isolated library path for STT to avoid conflicts with llama-server
 	cmd.Env = append(os.Environ(), fmt.Sprintf("LD_LIBRARY_PATH=%s:%s", binDir, os.Getenv("LD_LIBRARY_PATH")))
 
 	var out bytes.Buffer
@@ -249,7 +132,7 @@ func handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		log.Printf("Whisper failed: %v, Stderr: %s", err, stderr.String())
+		log.Printf("Neural STT Kernel failed: %v, Stderr: %s", err, stderr.String())
 		http.Error(w, "Transcription failed", http.StatusInternalServerError)
 		return
 	}
@@ -273,13 +156,6 @@ func handleWakeup(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	ready := isReady
-	mu.Unlock()
-	if !ready {
-		http.Error(w, "initializing", http.StatusServiceUnavailable)
-		return
-	}
 	_, _ = w.Write([]byte("OK"))
 }
 
