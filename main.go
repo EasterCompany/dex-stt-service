@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/EasterCompany/dex-go-utils/network"
 	"github.com/EasterCompany/dex-stt-service/utils"
 )
 
@@ -29,8 +31,9 @@ var (
 	buildDate = "unknown"
 	arch      = "unknown"
 
-	mu      sync.Mutex
-	isReady = false
+	mu       sync.Mutex
+	isReady  = false
+	noWarmup = false
 )
 
 type TranscribeResponse struct {
@@ -47,6 +50,7 @@ func main() {
 		os.Exit(0)
 	}
 
+	flag.BoolVar(&noWarmup, "no-warmup", false, "Skip model warmup on boot")
 	flag.Parse()
 
 	// Async verification of assets (provisioned by dex-cli during build)
@@ -79,12 +83,16 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8202"
+		port = "8401"
 	}
 
-	log.Printf("Starting Dexter STT Service (Neural STT Kernel) on port %s", port)
+	// Determine Binding Address
+	bindAddr := network.GetBestBindingAddress()
+	addr := fmt.Sprintf("%s:%s", bindAddr, port)
+
+	log.Printf("Starting Dexter STT Service on %s", addr)
 	utils.SetHealthStatus("OK", "Service is running")
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	if err := http.ListenAndServe(addr, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
@@ -131,9 +139,13 @@ func handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
+	var out, stderr bytes.Buffer
 	cmd := exec.CommandContext(ctx, sttBin, "-m", modelPath, "-f", audioPath, "-nt")
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
 
-	// ... (isolated library path logic)
+	// Ensure engine can find its own libs in the same dir
+	cmd.Env = append(os.Environ(), fmt.Sprintf("LD_LIBRARY_PATH=%s:%s", binDir, os.Getenv("LD_LIBRARY_PATH")))
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
